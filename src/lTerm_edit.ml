@@ -161,110 +161,30 @@ let dummy_cursor = Zed_edit.new_cursor dummy_engine
 let dummy_context = Zed_edit.context dummy_engine dummy_cursor
 let newline = UChar.of_char '\n'
 
-class edit ?(clipboard = clipboard) ?(macro = macro) () =
-  let locale, set_locale = S.create None in
+class virtual ['action] base_edit =
 object(self)
   inherit LTerm_widget.t "edit"
 
-  method clipboard = clipboard
-  method macro = macro
+  method virtual edit : unit Zed_edit.t
+  method virtual context : unit Zed_edit.context
+  method cursor = Zed_edit.cursor self#context
 
-  method can_focus = true
+  method virtual send_action : 'action -> unit
+  method virtual macro : 'action Zed_macro.t
+  method virtual insert : UChar.t -> unit
 
-  val mutable engine = dummy_engine
-  method engine = engine
-
-  val mutable cursor = dummy_cursor
-  method cursor = cursor
-
-  val mutable context = dummy_context
-  method context = context
-
-  method text = Zed_rope.to_string (Zed_edit.text engine)
+  method text = Zed_rope.to_string (Zed_edit.text self#edit)
 
   val mutable style = LTerm_style.none
   val mutable marked_style = LTerm_style.none
   val mutable current_line_style = LTerm_style.none
-  method update_resources =
+  method! update_resources =
     let rc = self#resource_class and resources = self#resources in
     style <- LTerm_resources.get_style rc resources;
     marked_style <- LTerm_resources.get_style (rc ^ ".marked") resources;
     current_line_style <- LTerm_resources.get_style (rc ^ ".current-line") resources
 
-  method editable pos len = true
-  method match_word text pos = match_by_regexp regexp_word text pos
-  method locale = S.value locale
-  method set_locale locale = set_locale locale
-
-  val mutable event = E.never
-  val mutable resolver = None
-
-  initializer
-    engine <- (
-      Zed_edit.create
-        ~editable:(fun pos len -> self#editable pos len)
-        ~match_word:(fun text pos -> self#match_word text pos)
-        ~clipboard
-        ~locale
-        ()
-    );
-    cursor <- Zed_edit.new_cursor engine;
-    context <- Zed_edit.context engine cursor;
-    Zed_edit.set_data engine (self :> edit);
-    event <- E.map (fun _ -> self#queue_draw) (Zed_edit.update engine [cursor]);
-    self#on_event
-      (function
-         | LTerm_event.Key key -> begin
-             let res = match resolver with Some res -> res | None -> Bindings.resolver [Bindings.pack (fun x -> x) !bindings] in
-             match Bindings.resolve key res with
-               | Bindings.Accepted actions ->
-                   resolver <- None;
-                   let rec exec = function
-                     | Zed action :: actions ->
-                         Zed_macro.add macro (Zed action);
-                         Zed_edit.get_action action context;
-                         exec actions
-                     | Start_macro :: actions ->
-                         Zed_macro.set_recording macro true;
-                         exec actions
-                     | Stop_macro :: actions ->
-                         Zed_macro.set_recording macro false;
-                         exec actions
-                     | Cancel_macro :: actions ->
-                         Zed_macro.cancel macro;
-                         exec actions
-                     | Play_macro :: actions ->
-                         Zed_macro.cancel macro;
-                         exec (Zed_macro.contents macro @ actions)
-                     | Insert_macro_counter :: actions ->
-                         Zed_macro.add macro Insert_macro_counter;
-                         Zed_edit.insert context (Zed_rope.of_string (string_of_int (Zed_macro.get_counter macro)));
-                         Zed_macro.add_counter macro 1;
-                         exec actions
-                     | (Add_macro_counter | Set_macro_counter) :: actions ->
-                         exec actions
-                     | [] ->
-                         true
-                   in
-                   exec actions
-               | Bindings.Continue res ->
-                   resolver <- Some res;
-                   true
-               | Bindings.Rejected ->
-                   if resolver = None then
-                     match key with
-                       | { control = false; meta = false; shift = false; code = Char ch } ->
-                           Zed_edit.insert context (Zed_rope.singleton ch);
-                           true
-                       | _ ->
-                           false
-                   else begin
-                     resolver <- None;
-                     false
-                   end
-           end
-         | _ ->
-             false)
+  method! can_focus = true
 
   val mutable shift = 0
   val mutable start = 0
@@ -276,8 +196,8 @@ object(self)
 
     (*** Check that the cursor is displayed ***)
 
-    let line_set = Zed_edit.lines engine in
-    let cursor_offset = Zed_cursor.get_position cursor in
+    let line_set = Zed_edit.lines self#edit in
+    let cursor_offset = Zed_cursor.get_position self#cursor in
     let cursor_line = Zed_lines.line_index line_set cursor_offset in
     let cursor_column = cursor_offset - Zed_lines.line_start line_set cursor_line in
 
@@ -357,7 +277,7 @@ object(self)
       ()
     in
 
-    let text = Zed_edit.text engine in
+    let text = Zed_edit.text self#edit in
 
     begin_line 0 (Zed_rope.Zip.make_f text start);
 
@@ -367,8 +287,8 @@ object(self)
     done;
 
     (* Colorize the selection if needed *)
-    if Zed_edit.get_selection engine then begin
-      let sel_offset = Zed_cursor.get_position (Zed_edit.mark engine) in
+    if Zed_edit.get_selection self#edit then begin
+      let sel_offset = Zed_cursor.get_position (Zed_edit.mark self#edit) in
       let sel_line = Zed_lines.line_index line_set sel_offset in
       let sel_column = sel_offset - Zed_lines.line_start line_set sel_line in
       let line_a, column_a, line_b, column_b =
@@ -413,10 +333,159 @@ object(self)
     end
 
   method cursor_position =
-    let line_set = Zed_edit.lines engine in
-    let cursor_offset = Zed_cursor.get_position cursor in
+    let line_set = Zed_edit.lines self#edit in
+    let cursor_offset = Zed_cursor.get_position (Zed_edit.cursor self#context) in
     let cursor_line = Zed_lines.line_index line_set cursor_offset in
     let cursor_column = cursor_offset - Zed_lines.line_start line_set cursor_line in
     let start_line = Zed_lines.line_index line_set start in
     Some { row = cursor_line - start_line; col = cursor_column - shift }
+end
+
+class edit ?(clipboard = clipboard) ?(macro = macro) () =
+  let locale, set_locale = S.create None in
+object(self)
+  inherit [action] base_edit
+
+  method clipboard = clipboard
+  method macro = macro
+
+  method can_focus = true
+
+  val mutable edit = dummy_engine
+  method edit = edit
+
+  val mutable cursor = dummy_cursor
+  method cursor = cursor
+
+  val mutable context = dummy_context
+  method context = context
+
+  method text = Zed_rope.to_string (Zed_edit.text edit)
+
+  method editable pos len = true
+  method match_word text pos = match_by_regexp regexp_word text pos
+  method locale = S.value locale
+  method set_locale locale = set_locale locale
+
+  val mutable event = E.never
+  val mutable resolver = None
+
+
+  method insert ch =
+    Zed_edit.insert context (Zed_rope.singleton ch)
+
+  method send_action = function
+    | Zed action ->
+        Zed_macro.add macro (Zed action);
+        Zed_edit.get_action action context
+    | Start_macro ->
+        Zed_macro.set_recording macro true
+    | Stop_macro ->
+        Zed_macro.set_recording macro false
+    | Cancel_macro ->
+        Zed_macro.cancel macro
+    | Play_macro ->
+        Zed_macro.cancel macro;
+        List.iter self#send_action (Zed_macro.contents macro)
+    | Insert_macro_counter ->
+        Zed_macro.add macro Insert_macro_counter;
+        Zed_rope.iter self#insert (Zed_rope.of_string (string_of_int (Zed_macro.get_counter macro)));
+        Zed_macro.add_counter macro 1
+    | (Add_macro_counter | Set_macro_counter) -> ()
+
+  initializer
+    edit <- (
+      Zed_edit.create
+        ~editable:(fun pos len -> self#editable pos len)
+        ~match_word:(fun text pos -> self#match_word text pos)
+        ~clipboard
+        ~locale
+        ()
+    );
+    cursor <- Zed_edit.new_cursor edit;
+    context <- Zed_edit.context edit cursor;
+    event <- E.map (fun _ -> self#queue_draw) (Zed_edit.update edit [cursor]);
+    self#on_event
+      (function
+         | LTerm_event.Key key -> begin
+             let res = match resolver with Some res -> res | None -> Bindings.resolver [Bindings.pack (fun x -> x) !bindings] in
+             match Bindings.resolve key res with
+               | Bindings.Accepted actions ->
+                   resolver <- None;
+                   List.iter self#send_action actions;
+                   true
+               | Bindings.Continue res ->
+                   resolver <- Some res;
+                   true
+               | Bindings.Rejected ->
+                   if resolver = None then
+                     match key with
+                       | { control = false; meta = false; shift = false; code = Char ch } ->
+                           self#insert ch;
+                           true
+                       | _ ->
+                           false
+                   else begin
+                     resolver <- None;
+                     false
+                   end
+           end
+         | _ ->
+             false)
+
+end
+
+
+class virtual line_editor = object(self)
+  inherit [Zed_rope.t] LTerm_read_line.engine () as read_line
+  inherit [LTerm_read_line.action] base_edit as base_edit
+
+  method text = Zed_rope.to_string (Zed_edit.text self#edit)
+
+  val mutable event = E.never
+  val mutable resolver = None
+
+  method! can_focus = true
+
+  initializer
+    event <- E.map (fun _ -> self#queue_draw) (Zed_edit.update self#edit [Zed_edit.cursor self#context]);
+    self#on_event
+      (function
+         | LTerm_event.Key key -> begin
+             let res =
+               match resolver with
+               | Some res -> res
+               | None -> Bindings.resolver [
+                   Bindings.pack (fun x -> x) !LTerm_read_line.bindings;
+                   Bindings.pack (List.map (fun x -> LTerm_read_line.Edit x)) !bindings]
+             in
+             match Bindings.resolve key res with
+               | Bindings.Accepted actions ->
+                   resolver <- None;
+                   List.iter self#send_action actions ;
+                   true
+               | Bindings.Continue res ->
+                   resolver <- Some res;
+                   true
+               | Bindings.Rejected ->
+                   if resolver = None then
+                     match key with
+                       | { control = false; meta = false; shift = false; code = Char ch } ->
+                           Zed_macro.add self#macro (Edit (Zed (Zed_edit.Insert ch)));
+                           self#insert ch ;
+                           true
+                       | _ ->
+                           false
+                   else begin
+                     resolver <- None;
+                     false
+                   end
+           end
+         | _ ->
+             false)
+
+  method! send_action = function
+    | Edit (Zed Newline) -> ()
+    | action -> read_line#send_action action
+
 end
